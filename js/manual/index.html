@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="csp-nonce" content="manual-nonce" />
+    <title>vango-stripe Manual Smoke</title>
+    <style>
+      :root {
+        --bg: #f6f7fb;
+        --card: #ffffff;
+        --text: #162033;
+        --muted: #586277;
+        --line: #d4d8e4;
+        --accent: #1356d4;
+        --danger: #b42318;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      main {
+        width: min(1100px, 100%);
+        margin: 0 auto;
+        padding: 24px;
+        display: grid;
+        gap: 18px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.5rem;
+      }
+      p {
+        margin: 0;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px;
+        display: grid;
+        gap: 12px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        gap: 10px;
+      }
+      label {
+        display: grid;
+        gap: 4px;
+        font-size: 0.85rem;
+      }
+      input,
+      select,
+      button {
+        font: inherit;
+      }
+      input,
+      select {
+        width: 100%;
+        padding: 8px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+      }
+      input[type="checkbox"] {
+        width: auto;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      button {
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: #fff;
+        padding: 8px 10px;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        color: #fff;
+        border-color: var(--accent);
+      }
+      button.warn {
+        border-color: var(--danger);
+        color: var(--danger);
+      }
+      .mount-boundary {
+        border: 1px dashed var(--line);
+        border-radius: 10px;
+        background: #fff;
+        min-height: 110px;
+        padding: 10px;
+      }
+      pre {
+        margin: 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #0e1525;
+        color: #dbe3ff;
+        padding: 10px;
+        height: 210px;
+        overflow: auto;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+      .inline {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <h1>vango-stripe Manual Smoke Harness</h1>
+        <p class="muted">
+          Serve this folder over HTTP (not file://), then mount/update/destroy islands directly.
+          This validates lifecycle behavior and event envelopes.
+        </p>
+      </section>
+
+      <section class="card">
+        <h2>Loader Check</h2>
+        <p class="muted">
+          Calls <code>getStripe(key)</code> twice and confirms instance reuse per publishable key.
+        </p>
+        <div class="grid">
+          <label>
+            Publishable key
+            <input id="loader-publishable-key" value="pk_test_replace_me" />
+          </label>
+        </div>
+        <div class="controls">
+          <button class="primary" id="loader-check">Run loader check</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Payment Element Island</h2>
+        <div class="grid">
+          <label>
+            Client secret
+            <input id="payment-client-secret" value="pi_test_replace_me_secret_replace_me" />
+          </label>
+          <label>
+            Return URL
+            <input id="payment-return-url" value="https://example.com/checkout/complete" />
+          </label>
+          <label>
+            Publishable key
+            <input id="payment-publishable-key" value="pk_test_replace_me" />
+          </label>
+          <label>
+            Locale
+            <input id="payment-locale" value="auto" />
+          </label>
+          <label>
+            Layout
+            <select id="payment-layout">
+              <option value="auto">auto</option>
+              <option value="tabs">tabs</option>
+              <option value="accordion">accordion</option>
+            </select>
+          </label>
+          <label>
+            Submit button text
+            <input id="payment-submit-text" value="Pay now" />
+          </label>
+          <label>
+            Remount key (optional)
+            <input id="payment-remount-key" />
+          </label>
+          <label class="inline">
+            <input id="payment-disable-submit" type="checkbox" />
+            Disable submit button
+          </label>
+          <label class="inline">
+            <input id="payment-emit-change" type="checkbox" />
+            Emit change events
+          </label>
+        </div>
+        <div class="controls">
+          <button class="primary" id="payment-mount">Mount</button>
+          <button id="payment-update">Update</button>
+          <button class="warn" id="payment-destroy">Destroy</button>
+        </div>
+        <div id="payment-root" class="mount-boundary">
+          <em class="muted">Payment island boundary</em>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Express Checkout Island</h2>
+        <div class="grid">
+          <label>
+            Client secret
+            <input id="express-client-secret" value="pi_test_replace_me_secret_replace_me" />
+          </label>
+          <label>
+            Return URL
+            <input id="express-return-url" value="https://example.com/checkout/complete" />
+          </label>
+          <label>
+            Publishable key
+            <input id="express-publishable-key" value="pk_test_replace_me" />
+          </label>
+          <label>
+            Locale
+            <input id="express-locale" value="auto" />
+          </label>
+          <label>
+            Button type
+            <select id="express-button-type">
+              <option value="buy">buy</option>
+              <option value="pay">pay</option>
+              <option value="book">book</option>
+              <option value="donate">donate</option>
+              <option value="checkout">checkout</option>
+              <option value="subscribe">subscribe</option>
+              <option value="plain">plain</option>
+            </select>
+          </label>
+          <label>
+            Button theme
+            <select id="express-button-theme">
+              <option value="">auto</option>
+              <option value="dark">dark</option>
+              <option value="light">light</option>
+              <option value="outline">outline</option>
+            </select>
+          </label>
+          <label>
+            Button height
+            <input id="express-button-height" value="44" />
+          </label>
+          <label>
+            Remount key (optional)
+            <input id="express-remount-key" />
+          </label>
+          <label>
+            Wallets.applePay
+            <select id="express-wallet-apple-pay">
+              <option value="">default</option>
+              <option value="auto">auto</option>
+              <option value="never">never</option>
+            </select>
+          </label>
+          <label>
+            Wallets.googlePay
+            <select id="express-wallet-google-pay">
+              <option value="">default</option>
+              <option value="auto">auto</option>
+              <option value="never">never</option>
+            </select>
+          </label>
+          <label>
+            Wallets.link
+            <select id="express-wallet-link">
+              <option value="">default</option>
+              <option value="auto">auto</option>
+              <option value="never">never</option>
+            </select>
+          </label>
+        </div>
+        <div class="controls">
+          <button class="primary" id="express-mount">Mount</button>
+          <button id="express-update">Update</button>
+          <button class="warn" id="express-destroy">Destroy</button>
+        </div>
+        <div id="express-root" class="mount-boundary">
+          <em class="muted">Express checkout island boundary</em>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Event Log</h2>
+        <div class="controls">
+          <button id="clear-log">Clear log</button>
+        </div>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script type="module">
+      import { getStripe, remountKey } from "../islands/stripe-loader.js";
+      import { mount as mountPaymentElement } from "../islands/stripe-payment-element.js";
+      import { mount as mountExpressCheckout } from "../islands/stripe-express-checkout.js";
+      import {
+        boolFromCheckbox,
+        createLogger,
+        createMockIslandAPI,
+        intFromInput,
+        stringFromInput,
+      } from "./manual-island-api.js";
+
+      const logEl = document.getElementById("log");
+      const logger = createLogger(logEl);
+
+      let paymentInstance = null;
+      let expressInstance = null;
+
+      function getPaymentProps() {
+        return {
+          clientSecret: stringFromInput(document.getElementById("payment-client-secret")),
+          returnURL: stringFromInput(document.getElementById("payment-return-url")),
+          publishableKey: stringFromInput(document.getElementById("payment-publishable-key")),
+          locale: stringFromInput(document.getElementById("payment-locale")) || "auto",
+          layout: stringFromInput(document.getElementById("payment-layout")) || "auto",
+          submitButtonText: stringFromInput(document.getElementById("payment-submit-text")) || "Pay now",
+          remountKey: stringFromInput(document.getElementById("payment-remount-key")),
+          disableSubmitButton: boolFromCheckbox(document.getElementById("payment-disable-submit")),
+          emitChangeEvents: boolFromCheckbox(document.getElementById("payment-emit-change")),
+        };
+      }
+
+      function getExpressProps() {
+        const wallets = {};
+        const applePay = stringFromInput(document.getElementById("express-wallet-apple-pay"));
+        const googlePay = stringFromInput(document.getElementById("express-wallet-google-pay"));
+        const link = stringFromInput(document.getElementById("express-wallet-link"));
+        if (applePay) wallets.applePay = applePay;
+        if (googlePay) wallets.googlePay = googlePay;
+        if (link) wallets.link = link;
+
+        const out = {
+          clientSecret: stringFromInput(document.getElementById("express-client-secret")),
+          returnURL: stringFromInput(document.getElementById("express-return-url")),
+          publishableKey: stringFromInput(document.getElementById("express-publishable-key")),
+          locale: stringFromInput(document.getElementById("express-locale")) || "auto",
+          buttonType: stringFromInput(document.getElementById("express-button-type")) || "buy",
+          buttonTheme: stringFromInput(document.getElementById("express-button-theme")),
+          buttonHeight: intFromInput(document.getElementById("express-button-height"), 44),
+          remountKey: stringFromInput(document.getElementById("express-remount-key")),
+        };
+        if (Object.keys(wallets).length > 0) out.wallets = wallets;
+        return out;
+      }
+
+      function safeDestroy(label, instance) {
+        if (instance && typeof instance.destroy === "function") {
+          try {
+            instance.destroy();
+            logger.line(`[${label}] destroy ok`);
+          } catch (err) {
+            logger.line(`[${label}] destroy error: ${err?.message || String(err)}`);
+          }
+        }
+      }
+
+      document.getElementById("loader-check").addEventListener("click", async () => {
+        const key = stringFromInput(document.getElementById("loader-publishable-key"));
+        logger.line("[loader] check started");
+        try {
+          const s1 = await getStripe(key);
+          const s2 = await getStripe(key);
+          logger.line(`[loader] success; same instance: ${String(s1 === s2)}`);
+        } catch (err) {
+          logger.line(`[loader] failed: ${err?.message || String(err)}`);
+        }
+      });
+
+      document.getElementById("payment-mount").addEventListener("click", () => {
+        safeDestroy("payment", paymentInstance);
+        const root = document.getElementById("payment-root");
+        const props = getPaymentProps();
+        logger.line(`[payment] mount key=${remountKey(props)}`);
+        paymentInstance = mountPaymentElement(
+          root,
+          props,
+          createMockIslandAPI("payment", logger),
+        );
+      });
+
+      document.getElementById("payment-update").addEventListener("click", () => {
+        if (!paymentInstance || typeof paymentInstance.update !== "function") {
+          logger.line("[payment] no instance to update");
+          return;
+        }
+        const props = getPaymentProps();
+        logger.line(`[payment] update key=${remountKey(props)}`);
+        paymentInstance.update(props);
+      });
+
+      document.getElementById("payment-destroy").addEventListener("click", () => {
+        safeDestroy("payment", paymentInstance);
+        paymentInstance = null;
+      });
+
+      document.getElementById("express-mount").addEventListener("click", () => {
+        safeDestroy("express", expressInstance);
+        const root = document.getElementById("express-root");
+        const props = getExpressProps();
+        logger.line(`[express] mount key=${remountKey(props)}`);
+        expressInstance = mountExpressCheckout(
+          root,
+          props,
+          createMockIslandAPI("express", logger),
+        );
+      });
+
+      document.getElementById("express-update").addEventListener("click", () => {
+        if (!expressInstance || typeof expressInstance.update !== "function") {
+          logger.line("[express] no instance to update");
+          return;
+        }
+        const props = getExpressProps();
+        logger.line(`[express] update key=${remountKey(props)}`);
+        expressInstance.update(props);
+      });
+
+      document.getElementById("express-destroy").addEventListener("click", () => {
+        safeDestroy("express", expressInstance);
+        expressInstance = null;
+      });
+
+      document.getElementById("clear-log").addEventListener("click", () => {
+        logger.clear();
+      });
+    </script>
+  </body>
+</html>
