@@ -490,10 +490,10 @@ This phase is about confidence, not new public API surface.
 
 ### Tasks
 1. Add example routes/components:
-   - “Proceed to payment” button runs an Action that creates a PaymentIntent.
-   - Render islands using `StripeUI`.
-   - Handle `OnIslandMessage` to update UI state (hints only).
-   - Return URL page reads `payment_intent` query param and verifies via resource.
+  - “Proceed to payment” button runs an Action that creates a PaymentIntent.
+  - Render islands using `StripeUI`.
+  - Handle `OnIslandMessage` to update UI state (hints only).
+  - Return URL page reads an opaque `ref` query param, scrubs Stripe-added params from the URL, and verifies via a server-owned mapping resource.
 2. Add webhook handlers:
    - minimal `payment_intent.succeeded` + `payment_intent.payment_failed`
    - dedupe by `event.ID`
@@ -508,7 +508,7 @@ Implement the example as a small, clearly separated slice:
 - `internal/payments/` (app-level Stripe service interface and Stripe-go implementation)
 - `app/routes/checkout/`:
   - `CheckoutPage` (Action to create PaymentIntent; render islands)
-  - `CheckoutCompletePage` (Resource to fetch PaymentIntent status from Stripe)
+  - `CheckoutCompletePage` (Resource to verify a stored `ref -> payment_intent_id` mapping before fetching PaymentIntent status)
 - `app/routes/webhooks/stripe/`:
   - `OnPaymentIntentSucceeded`, `OnPaymentIntentFailed` handlers
   - `processed_events` table pattern (or in-memory stub if no DB in example)

@@ -109,6 +109,7 @@ func TestWebhookHandler_MethodNotAllowed(t *testing.T) {
 func TestWebhookHandler_RequestBodyTooLarge(t *testing.T) {
 	h := WebhookHandler(WebhookConfig{Secret: "whsec_test_123", MaxBodyBytes: 8})
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/stripe", bytes.NewReader([]byte("123456789")))
+	req.Header.Set("Stripe-Signature", "t=1700000000,v1=deadbeef")
 	rr := httptest.NewRecorder()
 
 	h.ServeHTTP(rr, req)

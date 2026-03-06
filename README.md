@@ -7,6 +7,14 @@
 
 This package does not wrap Stripe API methods. Applications call `stripe-go` directly in Vango I/O-safe boundaries.
 
+## Pricing Boundary
+
+Stripe IDs are infrastructure identifiers, not trusted client inputs.
+
+- For fixed plans or tiers, client code should send a business-level `PlanKey` and the server should resolve it through a server-owned pricing catalog.
+- For carts, quotes, or negotiated checkouts, client code should send an opaque server-issued reference such as `checkoutID`; the server must recompute authoritative line items and totals.
+- Do not accept raw Stripe IDs such as `price_*`, `prod_*`, `pm_*`, `cus_*`, or `sub_*` from the client as billing decisions.
+
 ## Documentation Map
 
 - Canonical usage guide: [DEVELOPER_GUIDE.md](./DEVELOPER_GUIDE.md)
@@ -53,14 +61,21 @@ Div(
 ## Elements Flow (Minimal Recipe)
 
 1. Action creates a PaymentIntent via `stripe-go`.
-2. Render passes `pi.ClientSecret` + absolute `ReturnURL` into `ui.PaymentElement(...)`.
-3. Return page verifies PaymentIntent server-side.
-4. Webhook fulfillment is idempotent by Stripe `event.ID`.
+2. Action persists an opaque server-owned return reference bound to the expected PaymentIntent.
+3. Render passes `pi.ClientSecret` + absolute `ReturnURL` containing `?ref=...` into `ui.PaymentElement(...)`.
+4. Return page verifies by `ref`, not by a URL-supplied Stripe ID.
+5. Webhook fulfillment is idempotent by Stripe `event.ID`.
 
 ```go
 createIntent := setup.Action(&s,
-	func(ctx context.Context, _ struct{}) (*stripelib.PaymentIntent, error) {
-		return routes.GetDeps().Payments.CreatePaymentIntent(ctx, 2999, "usd", map[string]string{"order_id": "ord_123"})
+	func(ctx context.Context, _ struct{}) (*payments.PaymentIntentSession, error) {
+		return routes.GetDeps().Payments.CreatePaymentIntent(ctx, payments.PaymentIntentParams{
+			Amount:      2999,
+			Currency:    "usd",
+			Description: "Order #ord_123",
+			Metadata:    map[string]string{"order_id": "ord_123"},
+			OwnerKey:    currentOwnerKey(ctx),
+		})
 	},
 )
 
@@ -69,15 +84,24 @@ return func() *vango.VNode {
 		vango.OnActionIdle(func() *vango.VNode {
 			return Button(OnClick(func() { createIntent.Run(struct{}{}) }), Text("Proceed to payment"))
 		}),
-		vango.OnActionSuccess(func(pi *stripelib.PaymentIntent) *vango.VNode {
+		vango.OnActionSuccess(func(session *payments.PaymentIntentSession) *vango.VNode {
 			return routes.GetDeps().StripeUI.PaymentElement(stripe.PaymentElementProps{
-				ClientSecret: pi.ClientSecret,
-				ReturnURL:    "https://myapp.com/checkout/complete",
+				ClientSecret: session.PaymentIntent.ClientSecret,
+				ReturnURL:    "https://myapp.com/checkout/complete?ref=" + url.QueryEscape(session.ReturnRef),
 			})
 		}),
 	)
 }
 ```
+
+## Return URL Boundary
+
+Treat return URL query params as untrusted transport data.
+
+- Use an opaque server-issued `ref` as the canonical lookup key.
+- Do not call Stripe with a `payment_intent=pi_...` read directly from the browser URL.
+- If Stripe appends `payment_intent` or `payment_intent_client_secret`, server-side scrub them from the visible URL and keep only `ref`.
+- Bind the stored return ref to the current owner or tenant when the flow is authenticated.
 
 ## Webhooks
 
@@ -157,6 +181,7 @@ python3 -m http.server 8080
 - Calling Stripe APIs from render/setup/session-loop callbacks
 - Treating island success as authoritative fulfillment
 - Do not mix Elements and Checkout Sessions
+- Accepting raw Stripe `price_*` or other Stripe IDs from client input
 - Passing Checkout Session `cs_*` secrets to Elements islands
 - Missing CSP `frame-src https://hooks.stripe.com`
 - Returning non-2xx for accepted not-found webhook events

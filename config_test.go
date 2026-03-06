@@ -26,6 +26,18 @@ func TestNewUI_RejectsNonPublishableKey(t *testing.T) {
 	}
 }
 
+func TestNewUI_RejectsNonPublishableKey_DoesNotLeakKeyMaterial(t *testing.T) {
+	secretLike := "sk_test_secret123"
+	_, err := NewUI(UIConfig{PublishableKey: secretLike})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, secretLike) {
+		t.Fatalf("error leaked key material: %q", msg)
+	}
+}
+
 func TestNewUI_AcceptsPublishableKeyAndStoresConfig(t *testing.T) {
 	appearance := &ElementsAppearance{
 		Theme: "night",

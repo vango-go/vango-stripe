@@ -44,7 +44,8 @@ func NewUI(cfg UIConfig) (*UI, error) {
 	}
 	// Defensive: prevent accidental secret injection into client props.
 	if !strings.HasPrefix(cfg.PublishableKey, "pk_") {
-		return nil, fmt.Errorf("stripe: UIConfig.PublishableKey must be a publishable key (pk_*), got %q", cfg.PublishableKey)
+		// Do not echo the provided value to avoid leaking accidental secret material.
+		return nil, fmt.Errorf("stripe: UIConfig.PublishableKey must be a publishable key (pk_*)")
 	}
 	return &UI{cfg: cfg}, nil
 }
@@ -93,4 +94,3 @@ func (c WebhookConfig) maxBodyBytes() int64 {
 	}
 	return DefaultWebhookMaxBodyBytes
 }
-

@@ -31,8 +31,12 @@ type HandlerError struct {
 }
 
 func (e *HandlerError) Error() string {
-	if e.Err != nil {
-		return fmt.Sprintf("stripe webhook: %s: %v", e.Message, e.Err)
+	// Do not format/concatenate wrapped errors into the primary error string.
+	// HandlerError is commonly logged by applications, and wrapped errors can
+	// contain sensitive tokens or request context. Callers that want details
+	// can log e.Err explicitly (carefully) or use errors.Unwrap.
+	if e.Message == "" {
+		return "stripe webhook: handler error"
 	}
 	return fmt.Sprintf("stripe webhook: %s", e.Message)
 }
@@ -84,6 +88,12 @@ func WebhookHandler(cfg WebhookConfig, registrations ...EventRegistration) http.
 		}
 		defer r.Body.Close()
 
+		sigHeader := r.Header.Get("Stripe-Signature")
+		if sigHeader == "" {
+			http.Error(w, "Missing Stripe-Signature header", http.StatusBadRequest)
+			return
+		}
+
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 		if err != nil {
 			http.Error(w, "Failed to read body", http.StatusBadRequest)
@@ -91,12 +101,6 @@ func WebhookHandler(cfg WebhookConfig, registrations ...EventRegistration) http.
 		}
 		if int64(len(body)) > maxBody {
 			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-
-		sigHeader := r.Header.Get("Stripe-Signature")
-		if sigHeader == "" {
-			http.Error(w, "Missing Stripe-Signature header", http.StatusBadRequest)
 			return
 		}
 

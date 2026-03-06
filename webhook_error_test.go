@@ -91,3 +91,22 @@ func TestWebhookHandler_GenericErrorReturns500WithoutLeak(t *testing.T) {
 		t.Fatalf("secret token leaked in response body: %q", body)
 	}
 }
+
+func TestHandlerError_ErrorDoesNotIncludeWrappedErrorString(t *testing.T) {
+	he := &HandlerError{
+		StatusCode: http.StatusServiceUnavailable,
+		Message:    "maintenance",
+		Err:        errors.New("db unavailable sk_test_inline whsec_inline"),
+	}
+
+	msg := he.Error()
+	if !strings.Contains(msg, "maintenance") {
+		t.Fatalf("expected maintenance in error string, got %q", msg)
+	}
+	if strings.Contains(msg, "db unavailable") {
+		t.Fatalf("wrapped error string leaked into HandlerError.Error(): %q", msg)
+	}
+	if strings.Contains(msg, "sk_test_") || strings.Contains(msg, "whsec_") {
+		t.Fatalf("secret-like token leaked into HandlerError.Error(): %q", msg)
+	}
+}

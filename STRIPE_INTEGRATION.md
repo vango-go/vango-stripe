@@ -97,6 +97,29 @@ Payment state (succeeded, failed, pending, disputed) MUST be determined server-s
 Client-side island events (e.g., `confirmPayment` success callback) are **hints only** and
 MUST NOT be treated as authoritative payment confirmation.
 
+### I3A. Server-Authoritative Pricing Boundary Invariant
+
+Billing decisions MUST be made from server-owned application state, not from raw Stripe
+resource identifiers supplied by browsers or public clients.
+
+Applications MUST NOT accept client-provided Stripe identifiers as authoritative billing
+inputs, including (but not limited to):
+
+- Prices (`price_*`)
+- Products (`prod_*`)
+- Payment methods (`pm_*`)
+- Customers (`cus_*`)
+- Subscriptions (`sub_*`)
+
+Canonical application request boundaries are:
+
+- A business-level `PlanKey` resolved through a server-owned pricing catalog, or
+- An opaque server-issued identifier such as `checkoutID`, `quoteID`, or `cartID`
+
+Exception: a Stripe ID MAY be used as request input only when the server previously minted
+or persisted it, the request is authorized to access the bound record, and the ID is used
+only to look up server-owned state rather than to let the client choose billing parameters.
+
 ### I4. Webhook Security Invariant
 
 Webhook endpoints MUST:
@@ -1381,8 +1404,11 @@ type HandlerError struct {
 }
 
 func (e *HandlerError) Error() string {
-	if e.Err != nil {
-		return fmt.Sprintf("stripe webhook: %s: %v", e.Message, e.Err)
+	// Do not format wrapped errors into the primary error string. Wrapped errors
+	// often contain request context and may include sensitive tokens. If you want
+	// details for debugging, log e.Err explicitly (carefully) or use errors.Unwrap.
+	if e.Message == "" {
+		return "stripe webhook: handler error"
 	}
 	return fmt.Sprintf("stripe webhook: %s", e.Message)
 }
@@ -1632,7 +1658,94 @@ STRIPE_WEBHOOK_SECRET="whsec_..."
 `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are secret. Never commit or log.
 `STRIPE_PUBLISHABLE_KEY` is safe for client exposure.
 
-### 37.9.4 Dependency Injection Pattern (Canonical)
+### 37.9.4 Pricing Catalog + Dependency Injection Pattern (Canonical)
+
+**`internal/pricing/catalog.go`**:
+
+```go
+package pricing
+
+import (
+	"fmt"
+	"strings"
+)
+
+type PlanKey string
+
+const (
+	PlanProMonthly PlanKey = "pro_monthly"
+	PlanProAnnual  PlanKey = "pro_annual"
+)
+
+type Plan struct {
+	Key           PlanKey
+	StripePriceID string
+	DisplayName   string
+	Currency      string
+	Amount        int64
+	Interval      string
+}
+
+type CatalogConfig struct {
+	ProMonthlyPriceID string
+	ProAnnualPriceID  string
+}
+
+type Catalog struct {
+	plans map[PlanKey]Plan
+}
+
+func NewCatalog(cfg CatalogConfig) (*Catalog, error) {
+	plans := []Plan{
+		{
+			Key:           PlanProMonthly,
+			StripePriceID: strings.TrimSpace(cfg.ProMonthlyPriceID),
+			DisplayName:   "Pro Monthly",
+			Currency:      "usd",
+			Amount:        2900,
+			Interval:      "month",
+		},
+		{
+			Key:           PlanProAnnual,
+			StripePriceID: strings.TrimSpace(cfg.ProAnnualPriceID),
+			DisplayName:   "Pro Annual",
+			Currency:      "usd",
+			Amount:        29000,
+			Interval:      "year",
+		},
+	}
+
+	out := &Catalog{plans: make(map[PlanKey]Plan, len(plans))}
+	seenStripePrices := make(map[string]PlanKey, len(plans))
+
+	for _, plan := range plans {
+		if plan.Key == "" {
+			return nil, fmt.Errorf("pricing: empty plan key")
+		}
+		if plan.StripePriceID == "" {
+			return nil, fmt.Errorf("pricing: missing Stripe price id for %s", plan.Key)
+		}
+		if _, exists := out.plans[plan.Key]; exists {
+			return nil, fmt.Errorf("pricing: duplicate plan key %s", plan.Key)
+		}
+		if other, exists := seenStripePrices[plan.StripePriceID]; exists {
+			return nil, fmt.Errorf("pricing: duplicate Stripe price id for %s and %s", other, plan.Key)
+		}
+		seenStripePrices[plan.StripePriceID] = plan.Key
+		out.plans[plan.Key] = plan
+	}
+
+	return out, nil
+}
+
+func (c *Catalog) Resolve(key PlanKey) (Plan, bool) {
+	if c == nil {
+		return Plan{}, false
+	}
+	plan, ok := c.plans[key]
+	return plan, ok
+}
+```
 
 **`internal/payments/payments.go`**:
 
@@ -1641,18 +1754,26 @@ package payments
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"strings"
 
 	stripelib "github.com/stripe/stripe-go/v84"
 	"github.com/stripe/stripe-go/v84/client"
+	"myapp/internal/pricing"
 )
 
 // Service defines the payment operations your application needs.
 type Service interface {
-	CreatePaymentIntent(ctx context.Context, params PaymentIntentParams) (*stripelib.PaymentIntent, error)
+	CreatePaymentIntent(ctx context.Context, params PaymentIntentParams) (*PaymentIntentSession, error)
+	VerifyPaymentIntentReturn(ctx context.Context, params VerifyPaymentIntentReturnParams) (*stripelib.PaymentIntent, error)
 	GetPaymentIntent(ctx context.Context, id string) (*stripelib.PaymentIntent, error)
 	CreateSubscription(ctx context.Context, params SubscriptionParams) (*stripelib.Subscription, error)
 	GetSubscription(ctx context.Context, id string) (*stripelib.Subscription, error)
 	CancelSubscription(ctx context.Context, id string) (*stripelib.Subscription, error)
+	CreateCheckoutSession(ctx context.Context, params CheckoutSessionParams) (*stripelib.CheckoutSession, error)
+	CreateCheckoutSessionFromCheckout(ctx context.Context, checkoutID string) (*stripelib.CheckoutSession, error)
 	CreateBillingPortalSession(ctx context.Context, customerID, returnURL string) (*stripelib.BillingPortalSession, error)
 }
 
@@ -1662,26 +1783,71 @@ type PaymentIntentParams struct {
 	CustomerID  string
 	Description string
 	Metadata    map[string]string
+	OwnerKey    string
+}
+
+type PaymentIntentSession struct {
+	PaymentIntent *stripelib.PaymentIntent
+	ReturnRef     string
+}
+
+type VerifyPaymentIntentReturnParams struct {
+	ReturnRef string
+	OwnerKey  string
+}
+
+type PaymentIntentReturn struct {
+	ReturnRef       string
+	PaymentIntentID string
+	OwnerKey        string
+}
+
+type ReturnStore interface {
+	Save(ctx context.Context, rec PaymentIntentReturn) error
+	Lookup(ctx context.Context, returnRef string) (PaymentIntentReturn, error)
 }
 
 type SubscriptionParams struct {
 	CustomerID string
-	PriceID    string
+	PlanKey    pricing.PlanKey
+}
+
+type CheckoutMode string
+
+const (
+	CheckoutModePayment      CheckoutMode = "payment"
+	CheckoutModeSubscription CheckoutMode = "subscription"
+)
+
+type CheckoutSessionParams struct {
+	Mode          CheckoutMode
+	PlanKey       pricing.PlanKey
+	SuccessURL    string
+	CancelURL     string
+	CustomerEmail string
 }
 
 type StripeService struct {
-	client *client.API
+	client  *client.API
+	catalog *pricing.Catalog
+	returns ReturnStore
 }
 
-func New(secretKey string) *StripeService {
+func NewStripeService(secretKey string, catalog *pricing.Catalog, returns ReturnStore) (*StripeService, error) {
+	if catalog == nil {
+		return nil, errors.New("payments: pricing catalog is required")
+	}
+	if returns == nil {
+		return nil, errors.New("payments: return store is required")
+	}
 	c := &client.API{}
 	c.Init(secretKey, nil)
-	return &StripeService{client: c}
+	return &StripeService{client: c, catalog: catalog, returns: returns}, nil
 }
 
 func (s *StripeService) CreatePaymentIntent(
 	ctx context.Context, p PaymentIntentParams,
-) (*stripelib.PaymentIntent, error) {
+) (*PaymentIntentSession, error) {
 	params := &stripelib.PaymentIntentParams{
 		Amount:   stripelib.Int64(p.Amount),
 		Currency: stripelib.String(p.Currency),
@@ -1699,7 +1865,38 @@ func (s *StripeService) CreatePaymentIntent(
 		params.AddMetadata(k, v)
 	}
 	params.Context = ctx
-	return s.client.PaymentIntents.New(params)
+
+	pi, err := s.client.PaymentIntents.New(params)
+	if err != nil {
+		return nil, err
+	}
+
+	rec := PaymentIntentReturn{
+		ReturnRef:       newReturnRef(),
+		PaymentIntentID: pi.ID,
+		OwnerKey:        strings.TrimSpace(p.OwnerKey),
+	}
+	if err := s.returns.Save(ctx, rec); err != nil {
+		return nil, err
+	}
+
+	return &PaymentIntentSession{
+		PaymentIntent: pi,
+		ReturnRef:     rec.ReturnRef,
+	}, nil
+}
+
+func (s *StripeService) VerifyPaymentIntentReturn(
+	ctx context.Context, p VerifyPaymentIntentReturnParams,
+) (*stripelib.PaymentIntent, error) {
+	rec, err := s.returns.Lookup(ctx, strings.TrimSpace(p.ReturnRef))
+	if err != nil {
+		return nil, err
+	}
+	if ownerKey := strings.TrimSpace(rec.OwnerKey); ownerKey != "" && ownerKey != strings.TrimSpace(p.OwnerKey) {
+		return nil, errors.New("payments: payment return not found")
+	}
+	return s.GetPaymentIntent(ctx, rec.PaymentIntentID)
 }
 
 func (s *StripeService) GetPaymentIntent(
@@ -1710,13 +1907,26 @@ func (s *StripeService) GetPaymentIntent(
 	return s.client.PaymentIntents.Get(id, params)
 }
 
+func newReturnRef() string {
+	var raw [24]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		panic(err)
+	}
+	return "ret_" + base64.RawURLEncoding.EncodeToString(raw[:])
+}
+
 func (s *StripeService) CreateSubscription(
 	ctx context.Context, p SubscriptionParams,
 ) (*stripelib.Subscription, error) {
+	plan, ok := s.catalog.Resolve(p.PlanKey)
+	if !ok {
+		return nil, errors.New("payments: unknown plan key")
+	}
+
 	params := &stripelib.SubscriptionParams{
 		Customer: stripelib.String(p.CustomerID),
 		Items: []*stripelib.SubscriptionItemsParams{
-			{Price: stripelib.String(p.PriceID)},
+			{Price: stripelib.String(plan.StripePriceID)},
 		},
 		PaymentBehavior: stripelib.String("default_incomplete"),
 		PaymentSettings: &stripelib.SubscriptionPaymentSettingsParams{
@@ -1744,9 +1954,61 @@ func (s *StripeService) CancelSubscription(
 	return s.client.Subscriptions.Cancel(id, params)
 }
 
+func (s *StripeService) CreateCheckoutSession(
+	ctx context.Context, p CheckoutSessionParams,
+) (*stripelib.CheckoutSession, error) {
+	plan, ok := s.catalog.Resolve(p.PlanKey)
+	if !ok {
+		return nil, errors.New("payments: unknown plan key")
+	}
+
+	params := &stripelib.CheckoutSessionParams{
+		Mode: stripelib.String(string(p.Mode)),
+		LineItems: []*stripelib.CheckoutSessionLineItemParams{
+			{
+				Price:    stripelib.String(plan.StripePriceID),
+				Quantity: stripelib.Int64(1),
+			},
+		},
+		SuccessURL: stripelib.String(p.SuccessURL),
+		CancelURL:  stripelib.String(p.CancelURL),
+	}
+	if p.CustomerEmail != "" {
+		params.CustomerEmail = stripelib.String(p.CustomerEmail)
+	}
+	params.Context = ctx
+	return s.client.CheckoutSessions.New(params)
+}
+
+func (s *StripeService) CreateCheckoutSessionFromCheckout(
+	ctx context.Context, checkoutID string,
+) (*stripelib.CheckoutSession, error) {
+	checkout, err := loadAuthorizedCheckout(ctx, checkoutID)
+	if err != nil {
+		return nil, err
+	}
+
+	params := &stripelib.CheckoutSessionParams{
+		Mode:       stripelib.String(string(CheckoutModePayment)),
+		SuccessURL: stripelib.String(checkout.SuccessURL),
+		CancelURL:  stripelib.String(checkout.CancelURL),
+	}
+	for _, item := range checkout.Items {
+		params.LineItems = append(params.LineItems, &stripelib.CheckoutSessionLineItemParams{
+			Price:    stripelib.String(item.StripePriceID),
+			Quantity: stripelib.Int64(item.Quantity),
+		})
+	}
+	params.Context = ctx
+	return s.client.CheckoutSessions.New(params)
+}
+
 func (s *StripeService) CreateBillingPortalSession(
 	ctx context.Context, customerID, returnURL string,
 ) (*stripelib.BillingPortalSession, error) {
+	// SECURITY: never accept customerID or returnURL from client input.
+	// Derive customerID from the authenticated user record, and build returnURL
+	// from a trusted server-side origin (avoid open redirects).
 	params := &stripelib.BillingPortalSessionParams{
 		Customer:  stripelib.String(customerID),
 		ReturnURL: stripelib.String(returnURL),
@@ -1756,12 +2018,13 @@ func (s *StripeService) CreateBillingPortalSession(
 }
 ```
 
-**`cmd/server/main.go`** — Wiring:
+**`cmd/server/main.go`** - Wiring:
 
 ```go
 package main
 
 import (
+	"log"
 	"net/http"
 	"os"
 
@@ -1769,12 +2032,29 @@ import (
 	stripe "github.com/vango-go/vango-stripe"
 	"myapp/app/routes"
 	"myapp/internal/payments"
+	"myapp/internal/pricing"
 )
 
 	func main() {
 		// ... (config, database setup) ...
 
-		paymentsSvc := payments.New(os.Getenv("STRIPE_SECRET_KEY"))
+		catalog, err := pricing.NewCatalog(pricing.CatalogConfig{
+			ProMonthlyPriceID: os.Getenv("STRIPE_PRICE_PRO_MONTHLY"),
+			ProAnnualPriceID:  os.Getenv("STRIPE_PRICE_PRO_ANNUAL"),
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		returns, err := payments.NewDBReturnStore(pool)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		paymentsSvc, err := payments.NewStripeService(os.Getenv("STRIPE_SECRET_KEY"), catalog, returns)
+		if err != nil {
+			log.Fatal(err)
+		}
 		stripeUI := stripe.MustNewUI(stripe.UIConfig{
 			PublishableKey: os.Getenv("STRIPE_PUBLISHABLE_KEY"),
 			Locale:         "auto",
@@ -1815,6 +2095,13 @@ import (
 }
 ```
 
+**Billing boundary rule (MUST):**
+
+- Client/UI code may send a business-level `PlanKey`.
+- Client/UI code may send an opaque server-issued `checkoutID` / `quoteID` / `cartID`.
+- Client/UI code MUST NOT send raw Stripe IDs (`price_*`, `prod_*`, `cus_*`, `pm_*`, `sub_*`) as billing decisions.
+- Price/catalog resolution belongs inside the payments service or a tightly owned server-side layer.
+
 ### 37.9.5 Using Stripe in Resources and Actions (Elements Flow)
 
 **Creating a PaymentIntent and rendering the Payment Element:**
@@ -1852,12 +2139,14 @@ func CheckoutPage(p CheckoutPageProps) vango.Component {
 	return vango.Setup(p, func(s vango.SetupCtx[CheckoutPageProps]) vango.RenderFn {
 
 		createIntent := setup.Action(&s,
-			func(ctx context.Context, _ struct{}) (*stripelib.PaymentIntent, error) {
+			func(ctx context.Context, _ struct{}) (*payments.PaymentIntentSession, error) {
 				return routes.GetDeps().Payments.CreatePaymentIntent(ctx,
 					payments.PaymentIntentParams{
-						Amount:   2999, // $29.99
-						Currency: "usd",
-						Metadata: map[string]string{"order_id": "ord_123"},
+						Amount:      2999, // $29.99
+						Currency:    "usd",
+						Description: "Order #ord_123",
+						Metadata:    map[string]string{"order_id": "ord_123"},
+						OwnerKey:    currentOwnerKey(ctx), // stable user/tenant key; "" in unauthenticated flows
 					},
 				)
 			},
@@ -1883,14 +2172,15 @@ func CheckoutPage(p CheckoutPageProps) vango.Component {
 					return Div(Class("max-w-md mx-auto"),
 						Text("Preparing payment…"))
 				}),
-					vango.OnActionSuccess(func(pi *stripelib.PaymentIntent) *vango.VNode {
+					vango.OnActionSuccess(func(session *payments.PaymentIntentSession) *vango.VNode {
 						// Pure render: produce VNodes from action result.
 						// No Signal.Set(), no Navigate(), no side effects.
+						returnURL := "https://myapp.com/checkout/complete?ref=" + url.QueryEscape(session.ReturnRef)
 						return Div(
 							Class("max-w-md mx-auto"),
 							routes.GetDeps().StripeUI.PaymentElement(stripe.PaymentElementProps{
-								ClientSecret: pi.ClientSecret,
-								ReturnURL:    "https://myapp.com/checkout/complete",
+								ClientSecret: session.PaymentIntent.ClientSecret,
+								ReturnURL:    returnURL,
 							}),
 						)
 					}),
@@ -1969,7 +2259,7 @@ func CheckoutForm(p CheckoutFormProps) vango.Component {
 
 			routes.GetDeps().StripeUI.ExpressCheckoutElement(stripe.ExpressCheckoutProps{
 				ClientSecret: p.ClientSecret,
-				ReturnURL:    "https://myapp.com/checkout/complete",
+				ReturnURL:    "https://myapp.com/checkout/complete?ref=" + url.QueryEscape(returnRef),
 			},
 				OnIslandMessage(func(msg vango.IslandMessage) {
 					// Treat as untrusted input; decode explicitly.
@@ -2006,7 +2296,7 @@ func CheckoutForm(p CheckoutFormProps) vango.Component {
 
 			routes.GetDeps().StripeUI.PaymentElement(stripe.PaymentElementProps{
 				ClientSecret: p.ClientSecret,
-				ReturnURL:    "https://myapp.com/checkout/complete",
+				ReturnURL:    "https://myapp.com/checkout/complete?ref=" + url.QueryEscape(returnRef),
 			}),
 		)
 	}
@@ -2016,25 +2306,59 @@ func CheckoutForm(p CheckoutFormProps) vango.Component {
 
 ### 37.9.7 Return URL Verification Pattern
 
-When a user returns from a redirect-based payment method, verify server-side:
+When a user returns from a redirect-based payment method, verify server-side through an opaque, server-issued return reference.
+
+Security notes (MUST):
+
+- Treat all return-URL query parameters as **untrusted transport data**.
+- The canonical verification key is `ref`, not `payment_intent`.
+- `payment_intent` and `payment_intent_client_secret` MUST NEVER drive authorization or object selection.
+- Persist `return_ref -> expected payment_intent_id` server-side before returning control to the UI.
+- Bind the return ref to a stable owner key when the flow is authenticated (user ID or tenant ID).
+- If Stripe appends `payment_intent` or `payment_intent_client_secret`, scrub them from the visible URL with a server-side replace navigation that preserves only `ref`.
+- Unknown refs, missing refs, or owner mismatches must fail without fetching an arbitrary Stripe object.
 
 ```go
 type CheckoutCompleteProps struct {
-	PaymentIntentID string // from URL query: ?payment_intent=pi_xxx
+	InitialReturnRef string
+	OwnerKey         string
+}
+
+func CompletePage(ctx vango.Ctx) *vango.VNode {
+	returnRef := strings.TrimSpace(ctx.QueryParam("ref"))
+	if returnRef != "" && (ctx.QueryParam("payment_intent") != "" || ctx.QueryParam("payment_intent_client_secret") != "") {
+		ctx.Navigate("/checkout/complete?ref="+url.QueryEscape(returnRef), vango.WithReplace())
+		return Text("Redirecting…")
+	}
+
+	return Fragment(CheckoutComplete(CheckoutCompleteProps{
+		InitialReturnRef: returnRef,
+		OwnerKey:         currentOwnerKey(ctx), // tenant/user key; "" for unauthenticated demos
+	}))
 }
 
 func CheckoutComplete(p CheckoutCompleteProps) vango.Component {
 	return vango.Setup(p, func(s vango.SetupCtx[CheckoutCompleteProps]) vango.RenderFn {
 		props := s.Props()
+		returnRef := setup.URLParam(&s, "ref", p.InitialReturnRef, vango.Replace)
 
 		status := setup.ResourceKeyed(&s,
-			func() string { return props.Get().PaymentIntentID },
-			func(ctx context.Context, id string) (*stripelib.PaymentIntent, error) {
-				return routes.GetDeps().Payments.GetPaymentIntent(ctx, id)
+			func() payments.VerifyPaymentIntentReturnParams {
+				return payments.VerifyPaymentIntentReturnParams{
+					ReturnRef: strings.TrimSpace(returnRef.Get()),
+					OwnerKey:  props.Get().OwnerKey,
+				}
+			},
+			func(ctx context.Context, params payments.VerifyPaymentIntentReturnParams) (*stripelib.PaymentIntent, error) {
+				return routes.GetDeps().Payments.VerifyPaymentIntentReturn(ctx, params)
 			},
 		)
 
 		return func() *vango.VNode {
+			if strings.TrimSpace(returnRef.Get()) == "" {
+				return Div(Class("text-red-600"),
+					Text("Missing or invalid return reference."))
+			}
 			return status.Match(
 				vango.OnLoading(func() *vango.VNode {
 					return Div(Text("Verifying payment…"))
@@ -2064,6 +2388,8 @@ func CheckoutComplete(p CheckoutCompleteProps) vango.Component {
 	})
 }
 ```
+
+For non-database demos, a small in-memory TTL return store is acceptable. For real applications, persist the mapping in your database (for example: `stripe_payment_returns`) and enforce owner binding there.
 
 **Dual verification:** API verification on the return URL provides immediate feedback.
 Webhooks provide reliable fulfillment triggers regardless of whether the user reaches
@@ -2197,26 +2523,34 @@ Mock the `payments.Service` interface:
 
 ```go
 type mockPayments struct {
-	createPaymentIntentFn func(ctx context.Context, p payments.PaymentIntentParams) (*stripelib.PaymentIntent, error)
-	getPaymentIntentFn    func(ctx context.Context, id string) (*stripelib.PaymentIntent, error)
+	createPaymentIntentFn    func(ctx context.Context, p payments.PaymentIntentParams) (*payments.PaymentIntentSession, error)
+	verifyPaymentIntentFn    func(ctx context.Context, p payments.VerifyPaymentIntentReturnParams) (*stripelib.PaymentIntent, error)
+	getPaymentIntentFn       func(ctx context.Context, id string) (*stripelib.PaymentIntent, error)
 	// ...
 }
 
-func (m *mockPayments) CreatePaymentIntent(ctx context.Context, p payments.PaymentIntentParams) (*stripelib.PaymentIntent, error) {
+func (m *mockPayments) CreatePaymentIntent(ctx context.Context, p payments.PaymentIntentParams) (*payments.PaymentIntentSession, error) {
 	return m.createPaymentIntentFn(ctx, p)
+}
+
+func (m *mockPayments) VerifyPaymentIntentReturn(ctx context.Context, p payments.VerifyPaymentIntentReturnParams) (*stripelib.PaymentIntent, error) {
+	return m.verifyPaymentIntentFn(ctx, p)
 }
 
 // ...
 
 func TestCheckoutPage_CreatesPaymentIntent(t *testing.T) {
 	mock := &mockPayments{
-		createPaymentIntentFn: func(ctx context.Context, p payments.PaymentIntentParams) (*stripelib.PaymentIntent, error) {
+		createPaymentIntentFn: func(ctx context.Context, p payments.PaymentIntentParams) (*payments.PaymentIntentSession, error) {
 			if p.Amount != 2999 {
 				t.Errorf("expected 2999, got %d", p.Amount)
 			}
-			return &stripelib.PaymentIntent{
-				ID:           "pi_test_123",
-				ClientSecret: "pi_test_123_secret_abc",
+			return &payments.PaymentIntentSession{
+				PaymentIntent: &stripelib.PaymentIntent{
+					ID:           "pi_test_123",
+					ClientSecret: "pi_test_123_secret_abc",
+				},
+				ReturnRef: "ret_test_123",
 			}, nil
 		},
 	}
@@ -2465,17 +2799,26 @@ Do not widen `script-src` to a wildcard.
 
 Checkout Sessions redirect the user to Stripe's hosted page. No islands needed.
 
-**Service layer:**
+**Security rule:** Checkout Sessions must be created from server-authoritative pricing data.
+The browser may send a business-level `PlanKey` or an opaque `checkoutID`, but it must not
+choose Stripe `price_*` or other Stripe identifiers directly.
+
+**Fixed-plan service layer:**
 
 ```go
 func (s *StripeService) CreateCheckoutSession(
 	ctx context.Context, p CheckoutSessionParams,
 ) (*stripelib.CheckoutSession, error) {
+	plan, ok := s.catalog.Resolve(p.PlanKey)
+	if !ok {
+		return nil, errors.New("payments: unknown plan key")
+	}
+
 	params := &stripelib.CheckoutSessionParams{
 		Mode: stripelib.String(string(p.Mode)),
 		LineItems: []*stripelib.CheckoutSessionLineItemParams{
 			{
-				Price:    stripelib.String(p.PriceID),
+				Price:    stripelib.String(plan.StripePriceID),
 				Quantity: stripelib.Int64(1),
 			},
 		},
@@ -2490,18 +2833,17 @@ func (s *StripeService) CreateCheckoutSession(
 }
 ```
 
-**Component with render-pure navigation via Effect:**
+**Fixed-plan component with render-pure navigation via Effect:**
 
 ```go
 func PricingPage(p vango.NoProps) vango.Component {
 	return vango.Setup(p, func(s vango.SetupCtx[vango.NoProps]) vango.RenderFn {
-
 		checkout := setup.Action(&s,
-			func(ctx context.Context, priceID string) (string, error) {
+			func(ctx context.Context, plan pricing.PlanKey) (string, error) {
 				session, err := routes.GetDeps().Payments.CreateCheckoutSession(ctx,
 					payments.CheckoutSessionParams{
-						Mode:       "subscription",
-						PriceID:    priceID,
+						Mode:       payments.CheckoutModeSubscription,
+						PlanKey:    plan,
 						SuccessURL: "https://myapp.com/billing?status=success",
 						CancelURL:  "https://myapp.com/pricing",
 					},
@@ -2514,41 +2856,59 @@ func PricingPage(p vango.NoProps) vango.Component {
 			vango.DropWhileRunning(),
 		)
 
-		// Navigation is a side effect — it belongs in a post-commit Effect,
-		// NOT in a render callback. This Effect runs on the session loop
-		// after commit when the action state changes.
+		// Navigation is a side effect - it belongs in a post-commit Effect,
+		// not in a render callback.
 		s.Effect(func() vango.Cleanup {
 			if checkout.State() == vango.ActionSuccess {
-				url := checkout.Result()
-				vango.UseCtx().Navigate(url)
+				vango.UseCtx().Navigate(checkout.Result())
 			}
 			return nil
 		})
 
 		return func() *vango.VNode {
-			// Render is pure: produces VNodes from state, no side effects.
 			return Div(
 				Class("max-w-md mx-auto"),
-				H2(Text("Pro Plan — $29/mo")),
+				H2(Text("Pro Plan - $29/mo")),
 				Button(
-					OnClick(func() { checkout.Run("price_xxx") }),
+					OnClick(func() { checkout.Run(pricing.PlanProMonthly) }),
 					Disabled(checkout.State() == vango.ActionRunning),
 					Text("Subscribe"),
-				),
-				checkout.Match(
-					vango.OnActionRunning(func() *vango.VNode {
-						return Div(Text("Redirecting to checkout…"))
-					}),
-					vango.OnActionError(func(err error) *vango.VNode {
-						return Div(Class("text-red-600"),
-							Text("Failed to start checkout. Please try again."))
-					}),
 				),
 			)
 		}
 	})
 }
 ```
+
+**Variable-cart service boundary:**
+
+```go
+func (s *StripeService) CreateCheckoutSessionFromCheckout(
+	ctx context.Context, checkoutID string,
+) (*stripelib.CheckoutSession, error) {
+	checkout, err := s.checkouts.GetAuthorized(ctx, checkoutID)
+	if err != nil {
+		return nil, err
+	}
+
+	params := &stripelib.CheckoutSessionParams{
+		Mode:       stripelib.String(string(CheckoutModePayment)),
+		SuccessURL: stripelib.String(checkout.SuccessURL),
+		CancelURL:  stripelib.String(checkout.CancelURL),
+	}
+	for _, item := range checkout.Items {
+		params.LineItems = append(params.LineItems, &stripelib.CheckoutSessionLineItemParams{
+			Price:    stripelib.String(item.StripePriceID),
+			Quantity: stripelib.Int64(item.Quantity),
+		})
+	}
+	params.Context = ctx
+	return s.client.CheckoutSessions.New(params)
+}
+```
+
+This pattern keeps the browser on an opaque server-issued checkout reference while the
+server recomputes authoritative line items, quantities, discounts, and Stripe IDs.
 
 **Key difference from Elements flow:** the Action returns `session.URL` (a redirect URL).
 Navigation happens in an Effect (post-commit, on the session loop), not in render.
