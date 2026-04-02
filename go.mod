@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/stripe/stripe-go/v84 v84.2.0
-	github.com/vango-go/vango v0.0.0
+	github.com/vango-go/vango v0.1.0
 )
 
 require (
@@ -27,5 +27,3 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/net v0.50.0 // indirect
 )
-
-replace github.com/vango-go/vango => ../vango
